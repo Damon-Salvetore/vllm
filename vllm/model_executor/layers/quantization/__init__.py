@@ -33,6 +33,7 @@ QuantizationMethods = Literal[
     "mxfp4",
     "petit_nvfp4",
     "cpu_awq",
+    "bitnet",
 ]
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
@@ -107,6 +108,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 
     from .awq import AWQConfig
+    from .bitnet import BitNetConfig
     from .awq_marlin import AWQMarlinConfig
     from .bitsandbytes import BitsAndBytesConfig
     from .compressed_tensors.compressed_tensors import (
@@ -158,6 +160,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "mxfp4": Mxfp4Config,
         "petit_nvfp4": PetitNvFp4Config,
         "cpu_awq": CPUAWQConfig,
+        "bitnet": BitNetConfig,
     }
     # Update the `method_to_config` with customized quantization methods.
     method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)

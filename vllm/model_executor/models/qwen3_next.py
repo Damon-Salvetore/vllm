@@ -1105,6 +1105,7 @@ class Qwen3NextModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=vllm_config.quant_config,
         )
 
         def get_layer(prefix: str):
