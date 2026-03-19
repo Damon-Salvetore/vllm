@@ -3,7 +3,7 @@
 
 Weights: ternary {-1, 0, 1} stored as int2 packed (4 values per byte).
 Activations: per-token symmetric int8 at runtime.
-Kernel backend: TileLang int2 x int8 (prefill: GEMM, decode: GEMV).
+Kernel backend: TileLang int2 x int8 GEMM (all M values use prefill kernel).
 """
 
 from __future__ import annotations
@@ -195,10 +195,6 @@ class BitNetLinearMethod(LinearMethodBase):
             layer.weight_scale.data, requires_grad=False
         )
 
-        # Skip decode weight copy to save ~3GB VRAM.
-        # M=1 decode will fall through to prefill kernel (GEMM instead of GEMV).
-        layer.weight_decode = None
-
         # Pre-compile all TileLang kernels on first layer load
         import vllm.model_executor.layers.quantization.bitnet_kernels as _bk
         if not _bk._kernels_precompiled:
@@ -247,7 +243,6 @@ class BitNetLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         from vllm._custom_ops import scaled_int8_quant
         from vllm.model_executor.layers.quantization.bitnet_kernels import (
-            get_decode_kernel,
             get_prefill_kernel,
         )
         from vllm.model_executor.layers.quantization.bitnet_dequant import (
@@ -259,28 +254,21 @@ class BitNetLinearMethod(LinearMethodBase):
         x_flat = x.reshape(-1, K)
         x_int8, scale_a, _ = scaled_int8_quant(x_flat)
 
-        # 2. Kernel dispatch
-        if M == 1 and hasattr(layer, "weight_decode") and layer.weight_decode is not None:
-            # Decode path (GEMV)
-            kernel = get_decode_kernel(M, N, K)
-            int32_out = torch.zeros(M, N, device=x.device, dtype=torch.int32)
-            kernel(x_int8, layer.weight_decode, int32_out)
+        # 2. Kernel dispatch — all M values use prefill GEMM kernel
+        kernel, padded_m = get_prefill_kernel(M, N, K)
+        if padded_m > M:
+            x_padded = torch.zeros(
+                padded_m, K, device=x.device, dtype=torch.int8
+            )
+            x_padded[:M] = x_int8
+            int32_out = kernel(x_padded, qweight)[:M]
         else:
-            # Prefill path (GEMM) — kernel compiled with padded M
-            kernel, padded_m = get_prefill_kernel(M, N, K)
-            if padded_m > M:
-                x_padded = torch.zeros(
-                    padded_m, K, device=x.device, dtype=torch.int8
-                )
-                x_padded[:M] = x_int8
-                int32_out = kernel(x_padded, qweight)[:M]
-            else:
-                int32_out = kernel(x_int8, qweight)
+            int32_out = kernel(x_int8, qweight)
 
         # 3. Fused dequant: offset correction + scale + bias in one Triton kernel
         #    scale_a from vLLM = absmax/127 = inv_scale_a needed by dequant
         scale_b = weight_scale.float().reshape(-1)  # [N]
-        row_sum = x_int8.to(torch.int32).sum(dim=-1)  # [M] INT32 accumulate
+        row_sum = x_int8.sum(dim=-1, dtype=torch.int32)  # [M] no temp alloc
 
         out_bf16 = dequant_bias_triton(
             int32_out, scale_a, scale_b,

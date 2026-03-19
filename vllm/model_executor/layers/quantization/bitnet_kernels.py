@@ -4,18 +4,14 @@
 Contains:
 - activation_quant_int8: per-token symmetric INT8 quantization
 - pack_int2_weights: ternary {-1,0,1} -> int2 packed (4 per byte)
-- build_prefill_kernel: TileLang GEMM for M>1 (prefill)
-- build_decode_kernel: TileLang GEMV for M=1 (decode)
-- get_prefill_kernel / get_decode_kernel: LRU-cached kernel factories
-- prepare_decode_weight: convert sequential packing to interleaved format
+- build_prefill_kernel: TileLang GEMM for all M values
+- get_prefill_kernel: LRU-cached kernel factory with M-padding
 - precompile_all_kernels: pre-compile all (M, N, K) combos at startup
 """
 
 import functools
 import logging
-from typing import Any
 
-import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
@@ -187,9 +183,15 @@ def pack_int2_weights(weight: torch.Tensor) -> torch.Tensor:
     Returns:
         packed: [N, K//4] int8.
     """
-    assert weight.dim() == 2
+    if weight.dim() != 2:
+        raise ValueError(
+            f"pack_int2_weights expects 2D tensor, got {weight.dim()}D"
+        )
     N, K = weight.shape
-    assert K % 4 == 0
+    if K % 4 != 0:
+        raise ValueError(
+            f"K ({K}) must be divisible by 4 for int2 packing"
+        )
 
     offset = (weight.to(torch.int32) + 2).to(torch.uint8)
     offset = offset.reshape(N, K // 4, 4)
@@ -295,266 +297,6 @@ def build_prefill_kernel(
 
 
 # ---------------------------------------------------------------------------
-# TileLang decode kernel (GEMV, M = 1)
-# ---------------------------------------------------------------------------
-
-# CUDA source for fast int2 -> int8 dequantization
-_DECODE_I2_TO_I8_SOURCE = """template <typename T1, typename T2>
-__device__ void decode_i2s_to_i8s(T1 *_i2b, T2 *_i8s, const int N = 16)
-{
-    uint *i8s = reinterpret_cast<uint *>(_i8s);
-    uint const i2b = *reinterpret_cast<uint *>(_i2b);
-    static constexpr uint immLut = (0xf0 & 0xcc) | 0xaa;
-    static constexpr uint BOTTOM_MASK = 0x03030303;
-    static constexpr uint I8s_MAGIC_NUM = 0x00000000;
-    static constexpr uint MEDIAN_NUM = 0x02020202;
-#pragma unroll
-    for (int i = 0; i < (N / 4); i++)
-    {
-        asm volatile("lop3.b32 %0, %1, %2, %3, %4;\\n"
-                     : "=r"(i8s[i])
-                     : "r"(i2b >> (2 * i)), "n"(BOTTOM_MASK), "n"(I8s_MAGIC_NUM), "n"(immLut));
-        i8s[i] = __vsub4(i8s[i], MEDIAN_NUM);
-    }
-}
-template <typename T1, typename T2>
-__device__ void decode_i2u_to_i8s(T1 *_i2b, T2 *_i8s, const int N = 16)
-{
-    uint *i8s = reinterpret_cast<uint *>(_i8s);
-    uint const i2b = *reinterpret_cast<uint *>(_i2b);
-    static constexpr uint immLut = (0xf0 & 0xcc) | 0xaa;
-    static constexpr uint BOTTOM_MASK = 0x03030303;
-    static constexpr uint I8s_MAGIC_NUM = 0x00000000;
-#pragma unroll
-    for (int i = 0; i < (N / 4); i++)
-    {
-        asm volatile("lop3.b32 %0, %1, %2, %3, %4;\\n"
-                     : "=r"(i8s[i])
-                     : "r"(i2b >> (2 * i)), "n"(BOTTOM_MASK), "n"(I8s_MAGIC_NUM), "n"(immLut));
-    }
-}
-"""
-
-
-def build_decode_kernel(
-    M: int,
-    N: int,
-    K: int,
-    n_partition: int = 4,
-    reduce_thread: int = 32,
-):
-    """Build TileLang decode GEMV kernel (INT8 x INT2 -> INT32).
-
-    Uses interleaved weight packing (general_compress + interleave_weight).
-    Returns: compiled kernel callable: kernel(A_int8, qw_interleaved, C_int32).
-    """
-    import tilelang
-    import tilelang.language as T
-    from tilelang import tvm as tvm
-    from tvm import DataType
-
-    in_dtype = T.int8
-    out_dtype = T.int32
-    accum_dtype = T.int32
-    storage_nbit = 8
-    num_bits = 2
-    num_elems_per_byte = 4
-    MAX_TRANSACTION_SIZE_IN_BITS = 128
-    micro_size_k = MAX_TRANSACTION_SIZE_IN_BITS // DataType(in_dtype).bits
-    micro_size_k_compressed = micro_size_k // num_elems_per_byte
-    storage_dtype = T.int8
-    block_K = reduce_thread * micro_size_k
-
-    dp4a_size = 4
-
-    @T.prim_func
-    def program(
-        A: T.Buffer((M, K), in_dtype),
-        B: T.Buffer((N, K // storage_nbit * num_bits), storage_dtype),
-        C: T.Buffer((M, N), out_dtype),
-    ):
-        with T.Kernel(
-            T.ceildiv(N, n_partition),
-            M,
-            threads=(reduce_thread, n_partition),
-        ) as (bx, by):
-            A_local = T.alloc_local((micro_size_k,), in_dtype)
-            B_quant_local = T.alloc_local(
-                [micro_size_k_compressed], storage_dtype
-            )
-            B_dequantize_local = T.alloc_local([micro_size_k], in_dtype)
-            accum_res = T.alloc_local((1,), accum_dtype)
-            reduced_accum_res = T.alloc_local((1,), accum_dtype)
-
-            kr = T.thread_binding(0, reduce_thread, thread="threadIdx.x")
-            ni = T.thread_binding(0, n_partition, thread="threadIdx.y")
-
-            T.import_source(_DECODE_I2_TO_I8_SOURCE)
-
-            T.clear(accum_res)
-            for ko in T.serial(T.ceildiv(K, block_K)):
-                for v in T.vectorized(micro_size_k):
-                    A_local[v] = A[
-                        by, ko * block_K + kr * micro_size_k + v
-                    ]
-
-                for v in T.vectorized(micro_size_k_compressed):
-                    B_quant_local[v] = B[
-                        bx * n_partition + ni,
-                        ko * (reduce_thread * micro_size_k_compressed)
-                        + kr * micro_size_k_compressed
-                        + v,
-                    ]
-
-                T.call_extern(
-                    "handle",
-                    "decode_i2u_to_i8s",
-                    T.access_ptr(B_quant_local, "r"),
-                    T.access_ptr(B_dequantize_local, "w"),
-                )
-
-                for ki in T.serial(micro_size_k // dp4a_size):
-                    T.dp4a(
-                        A_local[ki * dp4a_size],
-                        B_dequantize_local[ki * dp4a_size],
-                        accum_res[0],
-                    )
-
-            with T.attr(
-                T.comm_reducer(
-                    lambda x, y: x + y, [T.cast(0, accum_dtype)]
-                ),
-                "reduce_scope",
-                T.reinterpret(T.uint64(0), dtype="handle"),
-            ):
-                T.evaluate(
-                    T.tvm_thread_allreduce(
-                        T.uint32(1),
-                        accum_res[0],
-                        True,
-                        reduced_accum_res[0],
-                        kr,
-                        dtype="handle",
-                    )
-                )
-            if kr == 0:
-                C[by, bx * n_partition + ni] = reduced_accum_res[0]
-
-    kernel = tilelang.compile(program)
-    return kernel
-
-
-# ---------------------------------------------------------------------------
-# Weight format conversion for decode kernel
-# ---------------------------------------------------------------------------
-
-def general_compress(
-    lowprecision_weight: np.ndarray,
-    source_bits: int = 2,
-    storage_dtype: type = np.int8,
-) -> np.ndarray:
-    """Compress low-bit weight array into packed bytes.
-
-    Args:
-        lowprecision_weight: [N, K] with values in [0, 2^source_bits).
-        source_bits: bits per element (2 for ternary).
-
-    Returns:
-        Packed array [N, K // elems_per_byte].
-    """
-    elems_per_byte = 8 // source_bits
-    if lowprecision_weight.dtype == np.float16:
-        lowprecision_weight = lowprecision_weight.astype(np.int8)
-    int8_weight = np.zeros(
-        (
-            *lowprecision_weight.shape[:-1],
-            lowprecision_weight.shape[-1] // elems_per_byte,
-        ),
-        dtype=np.int8,
-    )
-    for j in range(lowprecision_weight.shape[-1] // elems_per_byte):
-        for k in range(elems_per_byte):
-            int8_weight[:, j] |= (
-                lowprecision_weight[:, j * elems_per_byte + k]
-                << (source_bits * k)
-            )
-    return int8_weight.view(storage_dtype)
-
-
-def interleave_weight(
-    qweight: np.ndarray,
-    nbits: int = 2,
-    target_dtype: Any = None,
-) -> np.ndarray:
-    """Interleave packed weight for TileLang decode kernel memory access.
-
-    Args:
-        qweight: compressed weight from general_compress().
-        nbits: bits per element.
-        target_dtype: tilelang dtype (T.int8 or T.float16).
-
-    Returns:
-        Interleaved weight array.
-    """
-    import tilelang.language as T
-
-    if target_dtype is None:
-        target_dtype = T.int8
-
-    assert target_dtype in [T.float16, T.int8]
-    qweight = qweight.view(np.int32)
-    new_qweight = np.zeros_like(qweight)
-    bits_stride = 8 if target_dtype == T.int8 else 16
-    mask = (1 << nbits) - 1
-    num_groups = 32 // bits_stride
-    elems_per_group = bits_stride // nbits
-    for i in range(num_groups):
-        for j in range(elems_per_group):
-            offset = i * elems_per_group + j
-            shift = (offset % num_groups) * bits_stride + (
-                offset // num_groups
-            ) * nbits
-            new_qweight |= ((qweight >> (nbits * offset)) & mask) << shift
-
-    if nbits == 2 and target_dtype == T.float16:
-        n8_weight = new_qweight & np.int32(0xFF0000FF)
-        n8_weight |= ((new_qweight & np.int32(0x0000FF00)) >> 8) << 16
-        n8_weight |= ((new_qweight & np.int32(0x00FF0000)) >> 16) << 8
-        return n8_weight.view(np.int8)
-
-    return new_qweight.view(np.int8)
-
-
-def prepare_decode_weight(
-    qweight: torch.Tensor, N: int, K: int
-) -> torch.Tensor:
-    """Convert sequentially-packed int2 weights to interleaved decode format.
-
-    Args:
-        qweight: [N, K//4] int8 with simple sequential packing.
-        N: output dimension.
-        K: input dimension (unpacked).
-
-    Returns:
-        qweight_decode: [N, K//4] int8 in interleaved format for decode kernel.
-    """
-    import tilelang.language as T
-
-    # Unpack to raw unsigned 2-bit values
-    p = qweight.cpu().numpy().view(np.uint8)
-    v0 = p & 0x03
-    v1 = (p >> 2) & 0x03
-    v2 = (p >> 4) & 0x03
-    v3 = (p >> 6) & 0x03
-    raw = np.stack([v0, v1, v2, v3], axis=-1).reshape(N, K).astype(np.int8)
-
-    # Re-compress with general_compress + interleave
-    qw = general_compress(raw, source_bits=2, storage_dtype=np.int8)
-    qw = interleave_weight(qw, nbits=2, target_dtype=T.int8)
-    return torch.from_numpy(qw.copy()).to(device=qweight.device)
-
-
-# ---------------------------------------------------------------------------
 # Cached kernel factories
 # ---------------------------------------------------------------------------
 
@@ -591,11 +333,6 @@ def get_prefill_kernel(M: int, N: int, K: int):
     )
     return kernel, padded_m
 
-
-@functools.lru_cache(maxsize=64)
-def get_decode_kernel(M: int, N: int, K: int):
-    """Get or build a cached decode kernel for given dimensions."""
-    return build_decode_kernel(M, N, K)
 
 
 # ---------------------------------------------------------------------------

@@ -248,19 +248,30 @@ def dequant_bias_triton(
     Returns:
         [M, N] tensor in out_dtype.
     """
-    assert gemm_output.is_cuda
-    assert gemm_output.is_contiguous()
-    assert gemm_output.dtype in (torch.bfloat16, torch.float32, torch.int32)
+    if not gemm_output.is_cuda:
+        raise ValueError("gemm_output must be on CUDA device")
+    if not gemm_output.is_contiguous():
+        raise ValueError("gemm_output must be contiguous")
+    if gemm_output.dtype not in (torch.bfloat16, torch.float32, torch.int32):
+        raise ValueError(
+            f"gemm_output dtype must be bfloat16/float32/int32, got {gemm_output.dtype}"
+        )
 
     M, N = gemm_output.shape
     input_fp32 = gemm_output.dtype == torch.float32
     input_int32 = gemm_output.dtype == torch.int32
 
     scale_a = _prepare_scale(scale_a, M)
-    assert scale_a.shape[0] == M
+    if scale_a.shape[0] != M:
+        raise ValueError(
+            f"scale_a size {scale_a.shape[0]} != M ({M})"
+        )
 
     scale_b = _prepare_scale(scale_b, N)
-    assert scale_b.shape[0] == N
+    if scale_b.shape[0] != N:
+        raise ValueError(
+            f"scale_b size {scale_b.shape[0]} != N ({N})"
+        )
 
     has_bias = bias is not None
     if has_bias:
@@ -268,7 +279,10 @@ def dequant_bias_triton(
         if bias.dtype != torch.bfloat16:
             bias = bias.to(torch.bfloat16)
         bias = bias.contiguous() if not bias.is_contiguous() else bias
-        assert bias.shape[0] == N
+        if bias.shape[0] != N:
+            raise ValueError(
+                f"bias size {bias.shape[0]} != N ({N})"
+            )
     else:
         bias = scale_b  # dummy ptr, won't be loaded
 
@@ -287,7 +301,10 @@ def dequant_bias_triton(
         row_sum = (
             row_sum.contiguous() if not row_sum.is_contiguous() else row_sum
         )
-        assert row_sum.shape[0] == M
+        if row_sum.shape[0] != M:
+            raise ValueError(
+                f"row_sum size {row_sum.shape[0]} != M ({M})"
+            )
     else:
         row_sum = scale_a  # dummy ptr, won't be loaded
 
