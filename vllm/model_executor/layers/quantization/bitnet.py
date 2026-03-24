@@ -3,7 +3,10 @@
 
 Weights: ternary {-1, 0, 1} stored as int2 packed (4 values per byte).
 Activations: per-token symmetric int8 at runtime.
-Kernel backend: TileLang int2 x int8 GEMM (all M values use prefill kernel).
+Kernel backend: auto-selected per GPU SM version.
+  SM >= 120 (RTX 5080+): TileLang int2 x int8 GEMM
+  SM 80-89 (A100/3090/4090): BitBLAS int2 x int8 GEMM
+  Fallback: pure torch (unpack + matmul)
 """
 
 from __future__ import annotations
@@ -195,11 +198,37 @@ class BitNetLinearMethod(LinearMethodBase):
             layer.weight_scale.data, requires_grad=False
         )
 
-        # Pre-compile all TileLang kernels on first layer load
-        import vllm.model_executor.layers.quantization.bitnet_kernels as _bk
-        if not _bk._kernels_precompiled:
-            _bk._kernels_precompiled = True
-            _bk.precompile_all_kernels()
+        from vllm.model_executor.layers.quantization.bitnet_backend import (
+            BACKEND_BITBLAS,
+            detect_backend,
+            get_kernel_module,
+        )
+
+        # BitBLAS uses a different weight packing format (interleaved).
+        # Repack: unpack sequential int2 → int8 ternary → BitBLAS transform.
+        if detect_backend() == BACKEND_BITBLAS:
+            from vllm.model_executor.layers.quantization.bitnet_kernels_bitblas import (
+                transform_weight_bitblas,
+            )
+            N, K_packed = layer.weight.shape
+            K = K_packed * 4
+            # Unpack sequential int2 → int8 ternary {-1, 0, 1}
+            p = layer.weight.data.to(torch.uint8)
+            v0 = (p & 0x03).to(torch.int8) - 2
+            v1 = ((p >> 2) & 0x03).to(torch.int8) - 2
+            v2 = ((p >> 4) & 0x03).to(torch.int8) - 2
+            v3 = ((p >> 6) & 0x03).to(torch.int8) - 2
+            w_int8 = torch.stack([v0, v1, v2, v3], dim=-1).reshape(N, K)
+            layer.weight = Parameter(
+                transform_weight_bitblas(w_int8, N, K),
+                requires_grad=False,
+            )
+
+        # Pre-compile kernels on first layer load (once per backend)
+        km = get_kernel_module()
+        if km is not None and not km._kernels_precompiled:
+            km._kernels_precompiled = True
+            km.precompile_all_kernels()
 
     @torch.compiler.disable
     def apply(
@@ -208,7 +237,7 @@ class BitNetLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        qweight = layer.weight  # [N, K//4] int8 packed
+        qweight = layer.weight  # [N, K//4] int8 packed (or BitBLAS format)
         weight_scale = layer.weight_scale  # [N, 1] bf16 per-channel
         K = layer.input_size_per_partition
         N = layer.output_size_per_partition
@@ -216,20 +245,30 @@ class BitNetLinearMethod(LinearMethodBase):
         out_shape = x.shape[:-1] + (N,)
         M = x[..., 0].numel()  # total tokens
 
+        from vllm.model_executor.layers.quantization.bitnet_backend import (
+            BACKEND_TORCH,
+            detect_backend,
+        )
+
+        if detect_backend() == BACKEND_TORCH:
+            return self._apply_fallback(
+                x, bias, qweight, weight_scale, K, N, out_shape
+            )
+
         try:
-            return self._apply_tilelang(
+            return self._apply_kernel(
                 layer, x, bias, qweight, weight_scale, K, N, M, out_shape
             )
         except Exception as e:
             logger.warning(
-                "BitNet TileLang kernel failed (%s), falling back to torch",
+                "BitNet kernel failed (%s), falling back to torch",
                 e, exc_info=True,
             )
             return self._apply_fallback(
                 x, bias, qweight, weight_scale, K, N, out_shape
             )
 
-    def _apply_tilelang(
+    def _apply_kernel(
         self,
         layer: nn.Module,
         x: torch.Tensor,
@@ -242,8 +281,8 @@ class BitNetLinearMethod(LinearMethodBase):
         out_shape: tuple,
     ) -> torch.Tensor:
         from vllm._custom_ops import scaled_int8_quant
-        from vllm.model_executor.layers.quantization.bitnet_kernels import (
-            get_prefill_kernel,
+        from vllm.model_executor.layers.quantization.bitnet_backend import (
+            get_kernel_module,
         )
         from vllm.model_executor.layers.quantization.bitnet_dequant import (
             dequant_bias_triton,
@@ -254,8 +293,9 @@ class BitNetLinearMethod(LinearMethodBase):
         x_flat = x.reshape(-1, K)
         x_int8, scale_a, _ = scaled_int8_quant(x_flat)
 
-        # 2. Kernel dispatch — all M values use prefill GEMM kernel
-        kernel, padded_m = get_prefill_kernel(M, N, K)
+        # 2. Kernel dispatch — backend-agnostic (TileLang or BitBLAS)
+        km = get_kernel_module()
+        kernel, padded_m = km.get_prefill_kernel(M, N, K)
         if padded_m > M:
             x_padded = torch.zeros(
                 padded_m, K, device=x.device, dtype=torch.int8
