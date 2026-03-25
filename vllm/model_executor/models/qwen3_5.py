@@ -37,6 +37,7 @@ from vllm.config import (
 )
 from vllm.distributed import (
     get_pp_group,
+    get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import (
@@ -337,20 +338,27 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         #              and quant_config.get_name() == "bitnet")
         is_bitnet = getattr(config, "bitlinear", False)
         if is_bitnet:
+            tp_size = get_tensor_model_parallel_world_size()
             if self.layer_type == "linear_attention":
-                # GDN output dim = hidden_size (after rearrange h d -> (h d))
+                # GDN: after rearrange "h d -> (h d)", local dim = value_dim // tp
+                value_dim = getattr(config, "linear_num_value_heads", 48) \
+                    * getattr(config, "linear_head_v_dim", 128)
                 self.linear_attn.attn_sub_norm = RMSNorm(
-                    config.hidden_size, eps=config.rms_norm_eps
+                    value_dim // tp_size, eps=config.rms_norm_eps
                 )
             elif self.layer_type == "full_attention":
-                # Softmax attn output dim = num_heads * head_dim (may != hidden_size)
-                attn_out_dim = config.num_attention_heads * config.head_dim
+                # Softmax: local attn output dim = (num_heads // tp) * head_dim
+                head_dim = getattr(config, "head_dim", None) \
+                    or config.hidden_size // config.num_attention_heads
+                attn_out_dim = (config.num_attention_heads // tp_size) * head_dim
                 self.self_attn.attn_sub_norm = RMSNorm(
                     attn_out_dim, eps=config.rms_norm_eps
                 )
             if hasattr(self, "mlp") and isinstance(self.mlp, Qwen3_5MLP):
+                # MLP: gate_up output after SiluAndMul = intermediate_size
+                # (ColumnParallel splits by tp, but act_fn output is local)
                 self.mlp.ffn_sub_norm = RMSNorm(
-                    config.intermediate_size, eps=config.rms_norm_eps
+                    config.intermediate_size // tp_size, eps=config.rms_norm_eps
                 )
 
         self.input_layernorm = Qwen3_5RMSNorm(
