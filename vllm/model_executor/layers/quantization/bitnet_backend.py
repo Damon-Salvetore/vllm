@@ -36,6 +36,29 @@ def detect_backend() -> str:
 
     env_backend = os.environ.get("BITNET_KERNEL_BACKEND")
     if env_backend:
+        valid = {BACKEND_TILELANG, BACKEND_BITBLAS, BACKEND_TORCH}
+        if env_backend not in valid:
+            raise ValueError(
+                f"BITNET_KERNEL_BACKEND={env_backend!r} is invalid. "
+                f"Choose from: {', '.join(sorted(valid))}"
+            )
+        # Verify the requested backend is actually importable
+        if env_backend == BACKEND_TILELANG:
+            try:
+                import tilelang  # noqa: F401
+            except ImportError:
+                raise ImportError(
+                    "BITNET_KERNEL_BACKEND=tilelang but tilelang is not "
+                    "installed. Install with: pip install tilelang"
+                )
+        elif env_backend == BACKEND_BITBLAS:
+            try:
+                import bitblas  # noqa: F401
+            except ImportError:
+                raise ImportError(
+                    "BITNET_KERNEL_BACKEND=bitblas but bitblas is not "
+                    "installed. Install with: pip install bitblas"
+                )
         _selected_backend = env_backend
         logger.info("BitNet kernel backend (env override): %s", _selected_backend)
         return _selected_backend
