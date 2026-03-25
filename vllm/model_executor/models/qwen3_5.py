@@ -41,6 +41,7 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3_5RMSNorm,
+    RMSNorm,
 )
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -154,7 +155,7 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         Forward pass with three parts:
         1. Input projection
         2. Core attention (custom op)
-        3. Output projection
+        3. Output projection (with optional attn_sub_norm)
         """
         num_tokens = hidden_states.size(0)
 
@@ -201,7 +202,74 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+        # BitNet sub-norm before output projection
+        if hasattr(self, "attn_sub_norm"):
+            core_attn_out = self.attn_sub_norm(core_attn_out)
         output[:num_tokens], _ = self.out_proj(core_attn_out)
+
+
+class Qwen3_5Attention(Qwen3NextAttention):
+    """Qwen3.5 softmax attention with optional BitNet attn_sub_norm."""
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> None:
+        qkv, _ = self.qkv_proj(hidden_states)
+
+        (q_size, kv_size) = (
+            self.num_heads * self.head_dim * (1 + self.attn_output_gate),
+            self.num_kv_heads * self.head_dim,
+        )
+
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+        if self.attn_output_gate:
+            q, gate = q.split(
+                [self.num_heads * self.head_dim, self.num_heads * self.head_dim],
+                dim=-1,
+            )
+
+        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
+            -1, self.num_heads * self.head_dim
+        )
+        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
+            -1, self.num_kv_heads * self.head_dim
+        )
+
+        q, k = self.rotary_emb(positions, q, k)
+
+        attn_output = self.attn(q, k, v)
+
+        if self.attn_output_gate:
+            gate = torch.sigmoid(gate)
+            attn_output = attn_output * gate
+
+        # BitNet sub-norm before output projection
+        if hasattr(self, "attn_sub_norm"):
+            attn_output = self.attn_sub_norm(attn_output)
+
+        output[:], _ = self.o_proj(attn_output)
+
+
+class Qwen3_5MLP(Qwen3NextMLP):
+    """Qwen3.5 MLP with optional BitNet ffn_sub_norm."""
+
+    def forward(self, x):
+        gate_up, _ = self.gate_up_proj(x)
+        out = self.act_fn(gate_up)
+        # BitNet sub-norm before down_proj
+        if hasattr(self, "ffn_sub_norm"):
+            out = self.ffn_sub_norm(out)
+        out, _ = self.down_proj(out)
+
+        if self.expert_gate is not None:
+            import torch.nn.functional as F
+            out = F.sigmoid(self.expert_gate(x)[0]) * out
+
+        return out
 
 
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
@@ -232,7 +300,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 prefix=f"{prefix}.linear_attn",
             )
         elif self.layer_type == "full_attention":
-            self.self_attn = Qwen3NextAttention(
+            self.self_attn = Qwen3_5Attention(
                 config,
                 model_config=model_config,
                 cache_config=cache_config,
@@ -250,7 +318,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 prefix=f"{prefix}.mlp",
             )
         elif config.model_type == "qwen3_5_text":
-            self.mlp = Qwen3NextMLP(
+            self.mlp = Qwen3_5MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -259,6 +327,31 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             )
         else:
             raise ValueError(f"Invalid model_type {config.model_type}")
+
+        # BitNet sub-norms: extra RMSNorm before o_proj/out_proj and down_proj.
+        # Only created when the HF config has bitlinear=True.
+        # The hasattr check in forward() makes this backward-compatible.
+        # TODO: Enable once BitNet-distilled checkpoint with sub-norm weights
+        # is available. Current PTQ checkpoint doesn't have these weights.
+        # is_bitnet = (quant_config is not None
+        #              and quant_config.get_name() == "bitnet")
+        is_bitnet = getattr(config, "bitlinear", False)
+        if is_bitnet:
+            if self.layer_type == "linear_attention":
+                # GDN output dim = hidden_size (after rearrange h d -> (h d))
+                self.linear_attn.attn_sub_norm = RMSNorm(
+                    config.hidden_size, eps=config.rms_norm_eps
+                )
+            elif self.layer_type == "full_attention":
+                # Softmax attn output dim = num_heads * head_dim (may != hidden_size)
+                attn_out_dim = config.num_attention_heads * config.head_dim
+                self.self_attn.attn_sub_norm = RMSNorm(
+                    attn_out_dim, eps=config.rms_norm_eps
+                )
+            if hasattr(self, "mlp") and isinstance(self.mlp, Qwen3_5MLP):
+                self.mlp.ffn_sub_norm = RMSNorm(
+                    config.intermediate_size, eps=config.rms_norm_eps
+                )
 
         self.input_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
